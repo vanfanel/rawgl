@@ -4,15 +4,36 @@
  * Copyright (C) 2004-2005 Gregory Montoir (cyx@users.sourceforge.net)
  */
 
-#include <SDL.h>
-#define MIX_INIT_FLUIDSYNTH MIX_INIT_MID // renamed with SDL2_mixer >= 2.0.2
-#include <SDL_mixer.h>
-#include "aifcplayer.h"
+#include <SDL2/SDL.h>
 #include "file.h"
 #include "mixer.h"
 #include "sfxplayer.h"
 #include "systemstub.h"
 #include "util.h"
+
+// This define is needed to have the actual functions implementations.
+#define STS_MIXER_IMPLEMENTATION
+#include "sts_mixer.h"
+
+SDL_AudioDeviceID   audio_device = 0;
+sts_mixer_t mixer;
+
+sts_mixer_stream_t  stream;             // for the music
+int8_t music_buffer[256*2];
+
+static const float kGain = 1.f;
+static const float kPitch = 1.f;
+static const float kPan = 0.f;
+
+// STS : SDL2 audio callback
+static void audio_callback(void *userdata, Uint8* stream, int len) {
+	sts_mixer_mix_audio(&mixer, stream, len / (sizeof(int16_t) * 2));
+}
+
+static void music_callback(sts_mixer_sample_t *sample, void *userdata) {
+	// Here we fill-in the sample data. When it's depleted by sts_mixer, this fn is called again to refill it.
+	((SfxPlayer *)userdata)->readSamples((int8_t *)sample->data, sample->length / 2);
+}
 
 static uint8_t *convertMono8ToWav(const uint8_t *data, int freq, int size, const uint8_t mask = 0) {
 	static const uint8_t kHeaderData[] = {
@@ -45,159 +66,167 @@ static uint8_t *convertMono8ToWav(const uint8_t *data, int freq, int size, const
 struct Mixer_impl {
 
 	static const int kMixFreq = 44100;
-	static const int kMixBufSize = 4096;
-	static const int kMixChannels = 4;
 
-	Mix_Chunk *_sounds[4];
-	Mix_Music *_music;
+        // This is the number of chanels for the sts mixer.
+        // We create this number of _channels structs.
+        static const int kPcmChannels = 4;
+
+	struct {
+		int voice;
+		uint8_t channel;
+		uint8_t *sample_buffer;
+		sts_mixer_sample_t sample;
+	} _channels[kPcmChannels];
 
 	void init() {
-		memset(_sounds, 0, sizeof(_sounds));
-		_music = 0;
 
-		Mix_Init(MIX_INIT_OGG | MIX_INIT_FLUIDSYNTH);
-		if (Mix_OpenAudio(kMixFreq, AUDIO_S16SYS, 2, kMixBufSize) < 0) {
-			warning("Mix_OpenAudio failed: %s", Mix_GetError());
+                SDL_AudioSpec       want, have;
+
+		/* init SDL2 + audio */
+		want.format = AUDIO_S16SYS;
+		want.freq = kMixFreq;
+		want.channels = 2;
+		want.userdata = NULL;
+		want.samples = 512;
+		want.callback = audio_callback;
+
+		audio_device = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
+
+		sts_mixer_init(&mixer, have.freq, STS_MIXER_SAMPLE_FORMAT_16);
+
+                /* Silence all channels, and assign a channel number (0 to 3) to each _channel.
+		   This channel number won't change, and when the game wants to do something with
+		   channel n, we will refer to the channel in _channels[] by it's index. */
+		memset(_channels, 0, sizeof(_channels));
+		for (int i = 0; i < kPcmChannels; ++i) {
+			_channels[i].voice   = -1;
+			_channels[i].channel =  i;
 		}
-		Mix_AllocateChannels(kMixChannels);
+
+                /* Start consuming samples, and calling the SDL2 callback to refill the buffer when
+                   the buffer is consumed. */ 			      
+                SDL_PauseAudioDevice(audio_device, 0);
 	}
 	void quit() {
 		stopAll();
-		Mix_CloseAudio();
-		Mix_Quit();
+
+		SDL_PauseAudioDevice(audio_device, 1);
+		SDL_CloseAudioDevice(audio_device);
 	}
 
 	void update() {
-		for (int i = 0; i < kMixChannels; ++i) {
-			if (_sounds[i] && !Mix_Playing(i)) {
-				freeSound(i);
-			}
-		}
 	}
 
 	void playSoundRaw(uint8_t channel, const uint8_t *data, int freq, uint8_t volume) {
+
+		/* This function just builds a WAV file out of the raw sample, and then sends it to be
+		   played by playSoundWav(). */
 		int len = READ_BE_UINT16(data) * 2;
 		const int loopLen = READ_BE_UINT16(data + 2) * 2;
 		if (loopLen != 0) {
 			len = loopLen;
 		}
-		uint8_t *sample = convertMono8ToWav(data + 8, freq, len, 0x80);
+		
+		uint8_t *sample = convertMono8ToWav(data + 8, freq, len);
+
 		if (sample) {
 			playSoundWav(channel, sample, 0, volume, (loopLen != 0) ? -1 : 0);
-			free(sample);
 		}
+
+		/* DONT FREE THE SAMPLE BUFFER HERE, because sts_play_sample() returns immediately but
+		   we dont know for how long will sts_mix_audio be accessing the buffer to mix the
+		   sample into the mixing stream. */
 	}
 	void playSoundWav(uint8_t channel, const uint8_t *data, int freq, uint8_t volume, int loops = 0) {
-		if (memcmp(data + 8, "WAVEfmt ", 8) == 0 && READ_LE_UINT32(data + 16) == 16) {
-			const uint8_t *fmt = data + 20;
-			const int format = READ_LE_UINT16(fmt);
-			const int channels = READ_LE_UINT16(fmt + 2);
-			const int rate = READ_LE_UINT32(fmt + 4);
-			const int bits = READ_LE_UINT16(fmt + 14);
-			debug(DBG_SND, "wave format %d channels %d rate %d bits %d", format, channels, rate, bits);
-			const bool isMixerFormat = (format == 1 && channels == 2 && rate == kMixFreq && bits == 16);
-			if (isMixerFormat && (AUDIO_S16SYS == AUDIO_S16LSB)) {
-				Mix_Chunk *chunk = Mix_QuickLoad_WAV(const_cast<uint8_t *>(data));
-				playSound(channel, volume, chunk, loops);
-				return;
-			}
-			const bool doConvert = (format == 1 && channels == 1 && bits == 8 && (rate % 11025) != 0);
-			if (doConvert && freq != 0 && memcmp(data + 36, "data", 4) == 0) {
-				const int size = READ_LE_UINT32(data + 40);
-				uint8_t *sample = convertMono8ToWav(data + 44, freq, size);
-				if (sample) {
-					SDL_RWops *rw = SDL_RWFromConstMem(sample, READ_LE_UINT32(sample + 4) + 8);
-					Mix_Chunk *chunk = Mix_LoadWAV_RW(rw, 1);
-					playSound(channel, volume, chunk, loops);
-					free(sample);
-				}
-				return;
-			}
-                }
+
+		const uint8_t *pcm = data + 44;
+		const uint8_t *fmt = data + 20;
+		const int frequency = READ_LE_UINT32(fmt + 4);
 		const uint32_t size = READ_LE_UINT32(data + 4) + 8;
-		SDL_RWops *rw = SDL_RWFromConstMem(data, size);
-		Mix_Chunk *chunk = Mix_LoadWAV_RW(rw, 1);
-		playSound(channel, volume, chunk, loops);
-	}
-	void playSoundAiff(uint8_t channel, const uint8_t *data, uint8_t volume) {
-		const uint32_t size = READ_BE_UINT32(data + 4) + 8;
-		SDL_RWops *rw = SDL_RWFromConstMem(data, size);
-		Mix_Chunk *chunk = Mix_LoadWAV_RW(rw, 1);
-		playSound(channel, volume, chunk);
-	}
-	void playSound(uint8_t channel, int volume, Mix_Chunk *chunk, int loops = 0) {
-		stopSound(channel);
-		if (chunk) {
-			Mix_PlayChannel(channel, chunk, loops);
-		}
-		setChannelVolume(channel, volume);
-		_sounds[channel] = chunk;
+
+		/* We must lock access to every variable that is accessed from the sts_mixer side. */	
+		SDL_LockAudioDevice(audio_device);
+
+		/* We keep this pointer in each channel structure because the channel.sample.data pointer
+		   will be moved by sts_mixer as sound is played. We need the starting address so we can free
+		   the sample memory in freeSound() */
+		_channels[channel].sample_buffer = (uint8_t *) data;
+
+		_channels[channel].sample.length = size / sizeof(int8_t);
+		_channels[channel].sample.frequency = frequency;
+		/* sts_mixer supports SIGNED 8bit samples ONLY */
+		_channels[channel].sample.audio_format = STS_MIXER_SAMPLE_FORMAT_8; 
+		_channels[channel].sample.data = (void *) pcm;
+		_channels[channel].sample.loops = loops;
+		_channels[channel].sample.loops_done = 0;
+
+		//sts_mixer_stop_voice(&mixer, _channels[free_channel].voice);
+		_channels[channel].voice = sts_mixer_play_sample(&mixer, &(_channels[channel].sample), kGain, kPitch, kPan);
+		SDL_UnlockAudioDevice(audio_device);
+
 	}
 	void stopSound(uint8_t channel) {
-		Mix_HaltChannel(channel);
+    		SDL_LockAudioDevice(audio_device);
+		sts_mixer_stop_voice(&mixer, _channels[channel].voice);
 		freeSound(channel);
+    		SDL_UnlockAudioDevice(audio_device);
 	}
 	void freeSound(int channel) {
-		Mix_FreeChunk(_sounds[channel]);
-		_sounds[channel] = 0;
-	}
-	void setChannelVolume(uint8_t channel, uint8_t volume) {
-		Mix_Volume(channel, volume * MIX_MAX_VOLUME / 63);
-	}
-
-	void playMusic(const char *path) {
-		stopMusic();
-		_music = Mix_LoadMUS(path);
-		if (_music) {
-			Mix_VolumeMusic(MIX_MAX_VOLUME / 2);
-			Mix_PlayMusic(_music, 0);
-		} else {
-			warning("Failed to load music '%s', %s", path, Mix_GetError());
+		/* We check the channel to see if its voice is STS_MIXER_VOICE_STOPPED and 
+		   is NOT set to -1. Both conditions would mean the voice is stopped from the
+		   sts_mixer side of things, but not from this side: we have to free the sample
+		   buffer and set the voice to -1 in that case, so we KNOW the channel is stopped
+		   from the rawgl side, too! */
+		int voice = _channels[channel].voice;
+		if (!(voice < 0) && mixer.voices[voice].state == STS_MIXER_VOICE_STOPPED) {
+			if (_channels[channel].sample_buffer) {
+				free (_channels[channel].sample_buffer);
+				memset(&_channels[channel], 0, sizeof(sts_mixer_sample_t));
+				_channels[channel].voice = -1;
+			}			
 		}
 	}
-	void stopMusic() {
-		Mix_HaltMusic();
-		Mix_FreeMusic(_music);
-		_music = 0;
-	}
-
-	static void mixAifcPlayer(void *data, uint8_t *s16buf, int len) {
-		((AifcPlayer *)data)->readSamples((int16_t *)s16buf, len / 2);
-	}
-	void playAifcMusic(AifcPlayer *aifc) {
-		Mix_HookMusic(mixAifcPlayer, aifc);
-	}
-	void stopAifcMusic() {
-		Mix_HookMusic(0, 0);
+	void setChannelVolume(uint8_t channel, uint8_t volume) {
 	}
 
 	static void mixSfxPlayer(void *data, uint8_t *s16buf, int len) {
 		len /= 2;
 		int8_t *s8buf = (int8_t *)alloca(len);
 		memset(s8buf, 0, len);
+
 		((SfxPlayer *)data)->readSamples(s8buf, len / 2);
+
 		for (int i = 0; i < len; ++i) {
 			*(int16_t *)&s16buf[i * 2] = 256 * (int16_t)s8buf[i];
 		}
 	}
+
 	void playSfxMusic(SfxPlayer *sfx) {
-		Mix_HookMusic(mixSfxPlayer, sfx);
+
+                stream.sample.frequency =    sfx->_rate;
+		stream.sample.audio_format = STS_MIXER_SAMPLE_FORMAT_8;
+		stream.sample.length =       256*2;
+		stream.sample.data =         music_buffer;
+		stream.callback =            music_callback;
+                stream.userdata =            sfx;
+
+		/* Start consuming music samples and calling the music_callback function when needed to refill */
+		sts_mixer_play_stream(&mixer, &stream, 1.0f);
 	}
 	void stopSfxMusic() {
-		Mix_HookMusic(0, 0);
+		sts_mixer_stop_stream(&mixer, &stream);
 	}
 
 	void stopAll() {
 		for (int i = 0; i < 4; ++i) {
 			stopSound(i);
 		}
-		stopMusic();
 		stopSfxMusic();
 	}
 };
 
 Mixer::Mixer(SfxPlayer *sfx)
-	: _aifc(0), _sfx(sfx) {
+	: _sfx(sfx) {
 }
 
 void Mixer::init() {
@@ -211,7 +240,6 @@ void Mixer::quit() {
 		_impl->quit();
 		delete _impl;
 	}
-	delete _aifc;
 }
 
 void Mixer::update() {
@@ -235,10 +263,6 @@ void Mixer::playSoundWav(uint8_t channel, const uint8_t *data, uint16_t freq, ui
 }
 
 void Mixer::playSoundAiff(uint8_t channel, const uint8_t *data, uint8_t volume) {
-	debug(DBG_SND, "Mixer::playSoundAiff(%d, %d)", channel, volume);
-	if (_impl) {
-		return _impl->playSoundAiff(channel, data, volume);
-	}
 }
 
 void Mixer::stopSound(uint8_t channel) {
@@ -256,37 +280,21 @@ void Mixer::setChannelVolume(uint8_t channel, uint8_t volume) {
 }
 
 void Mixer::playMusic(const char *path) {
-	debug(DBG_SND, "Mixer::playMusic(%s)", path);
 	if (_impl) {
-		return _impl->playMusic(path);
+		return;
 	}
 }
 
 void Mixer::stopMusic() {
-	debug(DBG_SND, "Mixer::stopMusic()");
 	if (_impl) {
-		return _impl->stopMusic();
+		return;
 	}
 }
 
 void Mixer::playAifcMusic(const char *path, uint32_t offset) {
-	debug(DBG_SND, "Mixer::playAifcMusic(%s)", path);
-	if (!_aifc) {
-		_aifc = new AifcPlayer();
-	}
-	if (_impl) {
-		if (_aifc->play(Mixer_impl::kMixFreq, path, offset)) {
-			_impl->playAifcMusic(_aifc);
-		}
-	}
 }
 
 void Mixer::stopAifcMusic() {
-	debug(DBG_SND, "Mixer::stopAifcMusic()");
-	if (_impl && _aifc) {
-		_aifc->stop();
-		_impl->stopAifcMusic();
-	}
 }
 
 void Mixer::playSfxMusic(int num) {
