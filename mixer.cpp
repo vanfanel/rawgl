@@ -142,7 +142,7 @@ struct Mixer_impl {
 		const uint8_t *pcm = data + 44;
 		const uint8_t *fmt = data + 20;
 		const int frequency = READ_LE_UINT32(fmt + 4);
-		const uint32_t size = READ_LE_UINT32(data + 4) + 8;
+		const uint32_t size = READ_LE_UINT32(data + 40);
 
 		/* We must lock access to every variable that is accessed from the sts_mixer side. */	
 		SDL_LockAudioDevice(audio_device);
@@ -160,7 +160,7 @@ struct Mixer_impl {
 		_channels[channel].sample.loops = loops;
 		_channels[channel].sample.loops_done = 0;
 
-		//sts_mixer_stop_voice(&mixer, _channels[free_channel].voice);
+		//sts_mixer_stop_voice(&mixer, _channels[channel].voice);
 		_channels[channel].voice = sts_mixer_play_sample(&mixer, &(_channels[channel].sample), kGain, kPitch, kPan);
 		SDL_UnlockAudioDevice(audio_device);
 
