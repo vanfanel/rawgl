@@ -119,8 +119,6 @@ struct Mixer_impl {
 
 	void playSoundRaw(uint8_t channel, const uint8_t *data, int freq, uint8_t volume) {
 
-		/* This function just builds a WAV file out of the raw sample, and then sends it to be
-		   played by playSoundWav(). */
 		int len = READ_BE_UINT16(data) * 2;
 		const int loopLen = READ_BE_UINT16(data + 2) * 2;
 		if (loopLen != 0) {
@@ -130,40 +128,34 @@ struct Mixer_impl {
 		uint8_t *sample = convertMono8ToWav(data + 8, freq, len);
 
 		if (sample) {
-			playSoundWav(channel, sample, 0, volume, (loopLen != 0) ? -1 : 0);
-		}
+			const uint8_t *pcm = sample + 44;
+			const uint8_t *fmt = sample + 20;
+			const int frequency = READ_LE_UINT32(fmt + 4);
+			const uint32_t size = READ_LE_UINT32(sample + 40);
 
+			/* We must lock access to every variable that is accessed from the sts_mixer side. */	
+			SDL_LockAudioDevice(audio_device);
+
+			/* We keep this pointer in each channel structure because the channel.sample.data pointer
+			   will be moved by sts_mixer as sound is played. We need the starting address so we can free
+			   the sample memory in freeSound() */
+			_channels[channel].sample_buffer = (uint8_t *) sample;
+
+			_channels[channel].sample.length = size / sizeof(int8_t);
+			_channels[channel].sample.frequency = frequency;
+			/* sts_mixer supports SIGNED 8bit samples ONLY */
+			_channels[channel].sample.audio_format = STS_MIXER_SAMPLE_FORMAT_8; 
+			_channels[channel].sample.data = (void *) pcm;
+			_channels[channel].sample.loops = (loopLen != 0) ? -1 : 0;
+			_channels[channel].sample.loops_done = 0;
+
+			//sts_mixer_stop_voice(&mixer, _channels[channel].voice);
+			_channels[channel].voice = sts_mixer_play_sample(&mixer, &(_channels[channel].sample), kGain, kPitch, kPan);
+			SDL_UnlockAudioDevice(audio_device);
+		}
 		/* DONT FREE THE SAMPLE BUFFER HERE, because sts_play_sample() returns immediately but
 		   we dont know for how long will sts_mix_audio be accessing the buffer to mix the
 		   sample into the mixing stream. */
-	}
-	void playSoundWav(uint8_t channel, const uint8_t *data, int freq, uint8_t volume, int loops = 0) {
-
-		const uint8_t *pcm = data + 44;
-		const uint8_t *fmt = data + 20;
-		const int frequency = READ_LE_UINT32(fmt + 4);
-		const uint32_t size = READ_LE_UINT32(data + 40);
-
-		/* We must lock access to every variable that is accessed from the sts_mixer side. */	
-		SDL_LockAudioDevice(audio_device);
-
-		/* We keep this pointer in each channel structure because the channel.sample.data pointer
-		   will be moved by sts_mixer as sound is played. We need the starting address so we can free
-		   the sample memory in freeSound() */
-		_channels[channel].sample_buffer = (uint8_t *) data;
-
-		_channels[channel].sample.length = size / sizeof(int8_t);
-		_channels[channel].sample.frequency = frequency;
-		/* sts_mixer supports SIGNED 8bit samples ONLY */
-		_channels[channel].sample.audio_format = STS_MIXER_SAMPLE_FORMAT_8; 
-		_channels[channel].sample.data = (void *) pcm;
-		_channels[channel].sample.loops = loops;
-		_channels[channel].sample.loops_done = 0;
-
-		//sts_mixer_stop_voice(&mixer, _channels[channel].voice);
-		_channels[channel].voice = sts_mixer_play_sample(&mixer, &(_channels[channel].sample), kGain, kPitch, kPan);
-		SDL_UnlockAudioDevice(audio_device);
-
 	}
 	void stopSound(uint8_t channel) {
     		SDL_LockAudioDevice(audio_device);
@@ -256,10 +248,6 @@ void Mixer::playSoundRaw(uint8_t channel, const uint8_t *data, uint16_t freq, ui
 }
 
 void Mixer::playSoundWav(uint8_t channel, const uint8_t *data, uint16_t freq, uint8_t volume) {
-	debug(DBG_SND, "Mixer::playSoundWav(%d, %d)", channel, volume);
-	if (_impl) {
-		return _impl->playSoundWav(channel, data, freq, volume);
-	}
 }
 
 void Mixer::playSoundAiff(uint8_t channel, const uint8_t *data, uint8_t volume) {
